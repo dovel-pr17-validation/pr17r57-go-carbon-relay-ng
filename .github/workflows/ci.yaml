@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v[0-9]+.[0-9]+.[0-9]+**
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: 1.26.9
+          cache: false
+      - run: make test
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: 1.26.9
+          cache: false
+      - name: Install go-bindata
+        run: go install github.com/go-bindata/go-bindata/...@latest
+      - run: make LINUX_PACKAGE_GOARCH=amd64 build-linux
+      - run: make LINUX_PACKAGE_GOARCH=arm64 build-linux
+      - run: make build-win
+      - run: make build-darwin
+      - run: make build-bsd
+      - name: Build Docker image
+        run: make docker
+      - name: Build k8s Docker image
+        run: make docker-k8s
+      - name: Smoke test images
+        run: |
+          version=$(make print-version)
+          ./smoke_test.sh "carbon-relay-ng:${version}"
+          ./smoke_test.sh "carbon-relay-ng-k8s:${version}"
+      - name: Store version
+        run: make print-version > build/version.txt
+      - name: Upload package artifacts
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          include-hidden-files: true
+          name: package-artifacts
+          path: build
+
+  # Release, runs on tags only
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Download package artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: package-artifacts
+          path: build
+      - name: Position binary for image build context
+        run: |
+          cp build/bin/* .
+          cp build/bin/* operations/k8s/
+      - name: Compute image tags and target environment
+        id: image
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -e
+          short_sha="${GITHUB_SHA::7}"
+          if [ "$REF_TYPE" = "tag" ]; then
+            # Release: push to prod GAR with a single <version> tag.
+            internal_env=prod
+            version=$(cat build/version.txt)
+            tags="${version}"
+          elif [ "$REF_TYPE" = "branch" ] && [ "$REF_NAME" = "main" ]; then
+            # Main branch: push to dev GAR with immutable main-<sha> tag.
+            internal_env=dev
+            tags="main-${short_sha}"
+          else
+            echo "Refusing to publish image for unexpected ref: type=$REF_TYPE name=$REF_NAME" >&2
+            exit 1
+          fi
+          {
+            echo "internal_env=${internal_env}"
+            echo "tags<<EOF"
+            echo "${tags}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Push image to internal GAR
+        uses: grafana/shared-workflows/actions/docker-build-push-image@34f27887c37cafe70d34af57dfc86b468a31b8c4 # docker-build-push-image/v0.3.3
+        with:
+          tags: ${{ steps.image.outputs.tags }}
+          context: .
+          gar-environment: ${{ steps.image.outputs.internal_env }}
+          gar-image: carbon-relay-ng
+          push: true
+          registries: gar
+      - name: Push image to Docker Hub mirror staging
+        uses: grafana/shared-workflows/actions/docker-build-push-image@34f27887c37cafe70d34af57dfc86b468a31b8c4 # docker-build-push-image/v0.3.3
+        with:
+          tags: ${{ steps.image.outputs.tags }}
+          context: .
+          gar-environment: prod
+          gar-image: carbon-relay-ng
+          gar-repository: dockerhub-carbon-relay-ng-prod-mirror
+          push: true
+          registries: gar
+      - name: Push k8s image to internal GAR
+        uses: grafana/shared-workflows/actions/docker-build-push-image@34f27887c37cafe70d34af57dfc86b468a31b8c4 # docker-build-push-image/v0.3.3
+        with:
+          tags: ${{ steps.image.outputs.tags }}
+          context: operations/k8s
+          gar-environment: ${{ steps.image.outputs.internal_env }}
+          gar-image: carbon-relay-ng-k8s
+          push: true
+          registries: gar
+
+  github_binaries:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: 1.26.9
+          cache: false
+      - name: Run goreleaser
+        run: curl -sfL https://goreleaser.com/static/run | bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
